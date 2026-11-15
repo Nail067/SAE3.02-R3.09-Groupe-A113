@@ -1,4 +1,15 @@
 venv/
+.venv/
 __pycache__/
+*.pyc
 *.db
-.idea/
+.idea/*
+!.idea/runConfigurations/
+
+# Configuration locale (surcharge de deploy/carrefour.conf, jamais versionnée)
+deploy/carrefour.local.conf
+
+# Démarrage rapide
+.venv/
+donnees/
+wheels/

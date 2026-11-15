@@ -1,4 +1,4 @@
-"""Protocole applicatif V2I/V2V """
+"""Protocole applicatif V2I/V2V : messages JSON délimités par un saut de ligne (TCP brut)."""
 import json
 
 DEFAULT_PORT = 5050
@@ -14,13 +14,18 @@ class FrameBuffer:
     """Reconstitue les trames TCP et borne la taille d'une trame pour éviter une croissance infinie."""
 
     def __init__(self, max_size: int = MAX_FRAME_SIZE):
+        """Crée un tampon vide ; `max_size` borne la taille d'une trame (protection mémoire)."""
         if max_size < 1:
             raise ValueError("max_size doit être positif")
         self._buf = b""
         self.max_size = max_size
 
     def feed(self, data: bytes) -> list:
-        """Ajoute des octets reçus et renvoie les messages complets décodés."""
+        """Ajoute des octets reçus et renvoie les messages complets décodés.
+
+        Une trame trop grande ou un JSON invalide provoque ValueError ; l'appelant
+        peut alors fermer la connexion fautive plutôt que conserver un flux ambigu.
+        """
         self._buf += data
         messages = []
         while b"\n" in self._buf:
@@ -35,5 +40,5 @@ class FrameBuffer:
                 raise ValueError("Trame JSON invalide") from exc
             messages.append(message)
         if len(self._buf) > self.max_size:
-            raise ValueError("Trame TCP incomplète / trop volumineuse")
+            raise ValueError("Trame TCP incomplète trop volumineuse")
         return messages

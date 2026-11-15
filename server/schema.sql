@@ -1,4 +1,6 @@
--- Usage (VM Database) :  sudo mariadb < base/schema.sql
+-- =====================================================================
+-- SAÉ 3.02 – Carrefour connecté (groupe A113) : schéma MariaDB
+-- Usage (VM Database) :  sudo mariadb < server/schema.sql
 -- =====================================================================
 SET NAMES utf8mb4;   -- indispensable : les valeurs ENUM contiennent des accents
 CREATE DATABASE IF NOT EXISTS carrefour CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;

@@ -1,13 +1,21 @@
-"""Couche de persistance du serveur : MariaDB (production, variables DB_*) avec repli SQLite (tests locaux).
+"""Couche de persistance du serveur : MariaDB (production, variables DB_*) ou SQLite (sans DB_HOST : tests locaux).
 
-Tables : sessions_simulation, vehicules, evenements_priorite, evenements_trafic, journal_feux (voir base/schema.sql).
+Base distante configurée (DB_HOST) mais injoignable, au démarrage ou plus tard : le serveur NE bascule PAS sur SQLite
+(les données seraient éclatées entre deux bases). Il continue de tourner, les requêtes échouent vite et MariaDB est
+retentée au plus toutes les RETRY_S secondes ; l'IHM garde les événements en attente jusqu'au retour de la base.
+Seule exception : connecteur Python MariaDB absent (système trop ancien) -> SQLite.
+
+Tables : sessions_simulation, vehicules, evenements_priorite, evenements_trafic, journal_feux (voir server/schema.sql).
 """
 import logging
 import os
 import sqlite3
+import time
 from datetime import datetime
 
 log = logging.getLogger("carrefour.db")
+
+RETRY_S = 10  # délai minimal entre deux tentatives de connexion à une base MariaDB injoignable
 
 TABLES = ("sessions_simulation", "vehicules", "evenements_priorite", "evenements_trafic", "journal_feux")
 TYPES_CARREFOUR = ("4 branches", "T", "Y", "rond-point")
@@ -34,6 +42,7 @@ SQLITE_DDL = [
 
 
 def _now() -> str:
+    """Horodatage courant au format SQL (AAAA-MM-JJ HH:MM:SS)."""
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -50,37 +59,66 @@ class Database:
     """Accès aux 5 tables ; reconnexion automatique à MariaDB en cas de coupure."""
 
     def __init__(self):
+        """MariaDB si DB_HOST est défini (même injoignable pour l'instant), SQLite sinon ou si le connecteur manque."""
         self.backend = "sqlite"
         self.conn = None
         self._mariadb = None
+        self._retry_after = 0.0
         if os.environ.get("DB_HOST"):
             try:
                 import mariadb  # connecteur officiel MariaDB
                 self._mariadb = mariadb
+                self.backend = "mariadb"
+            except ImportError:
+                log.error("Connecteur Python MariaDB absent -> base SQLite locale")
+        if self.backend == "mariadb":
+            try:
                 self._connect_mariadb()
             except Exception as exc:  # noqa: BLE001
-                log.error("MariaDB indisponible (%s) -> repli SQLite", exc)
-                self.conn = None
-        if self.conn is None:
+                self._echec(exc)
+                log.warning("MariaDB injoignable au démarrage : le serveur démarre quand même et réessaiera "
+                            "(les postes IHM gardent leurs événements en attente)")
+        else:
             self.conn = sqlite3.connect(os.environ.get("SQLITE_PATH", "carrefour.db"), check_same_thread=False)
             for stmt in SQLITE_DDL:
                 self.conn.execute(stmt)
             self.conn.commit()
-            self.backend = "sqlite"
         log.info("Base de données : %s", self.backend)
+
+    def _echec(self, exc):
+        """Note une connexion MariaDB impossible : plus de tentative avant RETRY_S secondes (pas de blocage du serveur)."""
+        self.conn = None
+        self._retry_after = time.monotonic() + RETRY_S
+        log.error("MariaDB indisponible (%s) ; nouvelle tentative dans %d s", exc, RETRY_S)
+
+    def _assurer_connexion(self):
+        """Ouvre la connexion MariaDB si elle est absente ; échoue immédiatement pendant la pause entre deux tentatives."""
+        if self.conn is not None:
+            return
+        if time.monotonic() < self._retry_after:
+            raise ConnectionError("MariaDB indisponible (nouvelle tentative sous peu)")
+        try:
+            self._connect_mariadb()
+            log.info("Connexion MariaDB rétablie")
+        except Exception as exc:  # noqa: BLE001
+            self._echec(exc)
+            raise
 
     # ------------------------------------------------------------------ connexion
     def _connect_mariadb(self):
+        """Ouvre la connexion MariaDB à partir des variables DB_* (UTF-8 imposé pour les valeurs accentuées)."""
         self.conn = self._mariadb.connect(
             host=os.environ["DB_HOST"], port=int(os.environ.get("DB_PORT", 3306)),
             user=os.environ.get("DB_USER", "carrefour"), password=os.environ.get("DB_PASSWORD", ""),
-            database=os.environ.get("DB_NAME", "carrefour"), connect_timeout=5, autocommit=True,
+            database=os.environ.get("DB_NAME", "carrefour"), connect_timeout=2, autocommit=True,
             init_command="SET NAMES utf8mb4")  # indispensable : valeurs ENUM accentuées (accordée, priorité urgence…)
         self.backend = "mariadb"
 
     def _run(self, sql, params=(), fetch=False):
-        """Exécute une requête ; une reconnexion est tentée une fois si la liaison MariaDB est perdue."""
+        """Exécute une requête ; avec MariaDB, (re)connexion si nécessaire et une nouvelle tentative si la liaison a été perdue."""
         for attempt in (1, 2):
+            if self.backend == "mariadb":
+                self._assurer_connexion()
             try:
                 cur = self.conn.cursor()
                 cur.execute(sql, params)
@@ -94,21 +132,41 @@ class Database:
                 if self.backend == "mariadb" and attempt == 1:
                     log.warning("Requête échouée (%s) -> reconnexion", exc)
                     try:
-                        self._connect_mariadb()
-                        continue
-                    except Exception as exc2:  # noqa: BLE001
-                        log.error("Reconnexion impossible : %s", exc2)
+                        self.conn.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self.conn = None       # reconnexion immédiate à la deuxième tentative
+                    continue
                 raise
 
     # ------------------------------------------------------------------ écritures
-    def start_session(self, type_carrefour, regulation, densite, client=None) -> int:
-        """Ouvre une session de simulation et renvoie son identifiant."""
+    def start_session(self, type_carrefour, regulation, densite, client=None, heure=None) -> int:
+        """Ouvre une session de simulation et renvoie son identifiant (`heure` : début réel, sinon maintenant)."""
         return self._run("INSERT INTO sessions_simulation (date_debut, type_carrefour, regulation, densite_trafic, client)"
-                         " VALUES (?, ?, ?, ?, ?)", (_now(), type_carrefour, regulation, int(densite), client))
+                         " VALUES (?, ?, ?, ?, ?)", (heure or _now(), type_carrefour, regulation, int(densite), client))
 
-    def end_session(self, id_session):
-        """Renseigne la date de fin d'une session."""
-        self._run("UPDATE sessions_simulation SET date_fin = ? WHERE id_session = ? AND date_fin IS NULL", (_now(), id_session))
+    def end_session(self, id_session, heure=None):
+        """Renseigne la date de fin d'une session (si elle est encore ouverte)."""
+        self._run("UPDATE sessions_simulation SET date_fin = ? WHERE id_session = ? AND date_fin IS NULL",
+                  (heure or _now(), id_session))
+
+    def reopen_session(self, id_session):
+        """Rouvre une session fermée par une coupure réseau (le poste IHM s'est reconnecté)."""
+        self._run("UPDATE sessions_simulation SET date_fin = NULL WHERE id_session = ?", (id_session,))
+
+    def find_session(self, client):
+        """Identifiant de la dernière session enregistrée pour cette étiquette de poste (reprise après redémarrage), ou None."""
+        _, rows = self._run("SELECT id_session FROM sessions_simulation WHERE client = ? ORDER BY id_session DESC LIMIT 1",
+                            (client,), fetch=True)
+        return rows[0][0] if rows else None
+
+    def alive(self) -> bool:
+        """Vrai si la base répond (sert à distinguer une panne de base d'un message invalide)."""
+        try:
+            self._run("SELECT 1", fetch=True)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
     def add_vehicle(self, id_session, type_vehicule, direction, destination=None, etat="en circulation") -> int:
         """Enregistre un véhicule."""
@@ -119,24 +177,24 @@ class Database:
         """Met à jour l'état d'un véhicule."""
         self._run("UPDATE vehicules SET etat = ? WHERE id_vehicule = ?", (etat, id_vehicule))
 
-    def add_priority(self, id_session, id_vehicule, direction, resultat="accordée") -> int:
-        """Enregistre une demande de priorité (heure de la demande = maintenant)."""
+    def add_priority(self, id_session, id_vehicule, direction, resultat="accordée", heure=None) -> int:
+        """Enregistre une demande de priorité (`heure` : heure réelle de la demande, sinon maintenant)."""
         return self._run("INSERT INTO evenements_priorite (id_session, id_vehicule, heure_demande, direction, resultat)"
-                         " VALUES (?, ?, ?, ?, ?)", (id_session, id_vehicule, _now(), direction, resultat))
+                         " VALUES (?, ?, ?, ?, ?)", (id_session, id_vehicule, heure or _now(), direction, resultat))
 
     def finish_priority(self, id_priorite, duree_s, resultat="terminée"):
         """Clôture une demande de priorité (durée et résultat)."""
         self._run("UPDATE evenements_priorite SET duree_s = ?, resultat = ? WHERE id_priorite = ?", (float(duree_s), resultat, id_priorite))
 
-    def add_traffic_event(self, id_session, id_vehicule, type_evenement, details=None):
-        """Enregistre un événement de trafic."""
+    def add_traffic_event(self, id_session, id_vehicule, type_evenement, details=None, heure=None):
+        """Enregistre un événement de trafic (`heure` : heure réelle de l'événement, sinon maintenant)."""
         self._run("INSERT INTO evenements_trafic (id_session, id_vehicule, horodatage, type_evenement, details) VALUES (?, ?, ?, ?, ?)",
-                  (id_session, id_vehicule, _now(), type_evenement, (details or "")[:255]))
+                  (id_session, id_vehicule, heure or _now(), type_evenement, (details or "")[:255]))
 
-    def add_light_log(self, id_session, feu, etat, cause):
-        """Enregistre un changement d'état de feu."""
+    def add_light_log(self, id_session, feu, etat, cause, heure=None):
+        """Enregistre un changement d'état de feu (`heure` : heure réelle du changement, sinon maintenant)."""
         self._run("INSERT INTO journal_feux (id_session, horodatage, feu, etat, cause) VALUES (?, ?, ?, ?, ?)",
-                  (id_session, _now(), feu, etat, cause))
+                  (id_session, heure or _now(), feu, etat, cause))
 
     # ------------------------------------------------------------------ lectures
     def history(self, table: str, limit: int = 100):

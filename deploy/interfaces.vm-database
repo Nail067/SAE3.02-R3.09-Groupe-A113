@@ -1,0 +1,12 @@
+# /etc/network/interfaces – VM DATABASE (base de données) (Debian 12)
+auto lo
+iface lo inet loopback
+
+# Adaptateur 1 : NAT VirtualBox – UNIQUEMENT pour l'installation (apt). À déconnecter ensuite.
+allow-hotplug enp0s3
+iface enp0s3 inet dhcp
+
+# Adaptateur 2 : réseau « données » (réseau interne VirtualBox) – seul lien avec la VM Serveur
+auto enp0s8
+iface enp0s8 inet static
+    address 10.10.10.2/24
