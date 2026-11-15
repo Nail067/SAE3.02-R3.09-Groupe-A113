@@ -1,42 +1,43 @@
 """Moteur de simulation du carrefour connecté (logique pure, sans dépendance Qt).
 
-Circulation à droite, feux tricolores / STOP / priorité à droite, véhicules d'urgence
+Circulation à droite, deux types de carrefour (4 voies à feux, rond-point), véhicules d'urgence
 et prise en charge des demandes de priorité V2I/V2V.
 """
 import math
 import random
-from collections import deque
 
 CX = CY = 400                 # centre de la scène (800 x 800)
 EDGE, HALF, LANE = 400, 60, 30
-S_STOP = EDGE - 82            # abscisse curviligne de la ligne d'arrêt
+S_STOP = EDGE - 82            # abscisse curviligne de la ligne d'arrêt (feux)
 ACC, DECEL = 90.0, 200.0      # accélération / décélération (px/s²)
 SIDES = ("Nord", "Sud", "Est", "Ouest")
 IN_DIR = {"Nord": (0, 1), "Sud": (0, -1), "Est": (-1, 0), "Ouest": (1, 0)}    # sens en entrant depuis ce côté
 OUT_DIR = {"Nord": (0, -1), "Sud": (0, 1), "Est": (1, 0), "Ouest": (-1, 0)}   # sens en sortant vers ce côté
 OPP = {"Nord": "Sud", "Sud": "Nord", "Est": "Ouest", "Ouest": "Est"}
-RIGHT_OF = {"Nord": "Ouest", "Ouest": "Sud", "Sud": "Est", "Est": "Nord"}     # côté prioritaire (à droite)
+RIGHT_OF = {"Nord": "Ouest", "Ouest": "Sud", "Sud": "Est", "Est": "Nord"}     # côté à droite (virage à droite)
+# Rond-point, distances au centre (px) : îlot central, axe de la voie circulante, bord extérieur de l'anneau,
+# début de la zone de croisement, ligne de cédez-le-passage ; angle d'insertion / de sortie (degrés)
+RING_ISLAND, RING_R, RING_OUT, RING_HALF, RING_STOP = 58, 79, 100, 108, 118
+RING_JOIN = 24
 
 JUNCTIONS = {
-    "Feux tricolores – 4 branches": dict(branches=SIDES, mode="lights", phases=[{"Nord", "Sud"}, {"Est", "Ouest"}]),
-    "Feux tricolores – 3 branches (T)": dict(branches=("Nord", "Sud", "Ouest"), mode="lights",
-                                             phases=[{"Nord", "Sud"}, {"Ouest"}]),
-    "STOP – 4 branches": dict(branches=SIDES, mode="stop", phases=[]),
-    "Priorité à droite – 4 branches": dict(branches=SIDES, mode="prio", phases=[]),
+    "Carrefour à 4 voies": dict(mode="lights", phases=[{"Nord", "Sud"}, {"Est", "Ouest"}]),
+    "Rond-point": dict(mode="round", phases=[]),
 }
 DB_MAP = {  # (type_carrefour, regulation) tels que stockés en base
-    "Feux tricolores – 4 branches": ("4 branches", "feux"), "Feux tricolores – 3 branches (T)": ("T", "feux"),
-    "STOP – 4 branches": ("4 branches", "panneaux"), "Priorité à droite – 4 branches": ("4 branches", "panneaux")}
+    "Carrefour à 4 voies": ("4 branches", "feux"), "Rond-point": ("rond-point", "giratoire")}
 KIND_FR = {"car": "voiture", "truck": "camion", "bus": "bus"}
 EMERGENCY_TYPES = {"Ambulance": "#f4f6f8", "Pompiers": "#d62828", "Police": "#2b4c9b"}
 CAR_COLORS = ["#d93a2f", "#2f6fd9", "#e8e8e8", "#202225", "#f0b429", "#2fa36b", "#e0782c", "#7a8590", "#8a4fd0"]
 
 
 def _right(d):
+    """Renvoie le vecteur directeur tourné d'un quart de tour vers la droite (circulation à droite)."""
     return (-d[1], d[0])
 
 
 def _dot(a, b):
+    """Produit scalaire de deux vecteurs 2D."""
     return a[0] * b[0] + a[1] * b[1]
 
 
@@ -44,6 +45,7 @@ class Path:
     """Trajectoire polygonale paramétrée par l'abscisse curviligne s."""
 
     def __init__(self, pts):
+        """Construit la trajectoire à partir de ses points et précalcule les abscisses curvilignes cumulées."""
         self.pts, self.cum = pts, [0.0]
         for a, b in zip(pts, pts[1:]):
             self.cum.append(self.cum[-1] + math.dist(a, b))
@@ -54,7 +56,7 @@ class Path:
     def box_points(self):
         """Points échantillonnés de la trajectoire dans la zone de croisement."""
         if self._box is None:
-            self._box = [self.pose(s)[:2] for s in range(EDGE - HALF, int(self.s_exit) + 1, 10)]
+            self._box = [self.pose(s)[:2] for s in range(int(self.cum[1]), int(self.s_exit) + 1, 10)]
         return self._box
 
     def pose(self, s):
@@ -88,10 +90,39 @@ def build_path(origin, dest, lane_off=LANE):
     return Path(pts + [x, q])
 
 
+def _lisser(pts, passes=2):
+    """Lissage de Chaikin : arrondit les angles de la polyligne en gardant ses deux extrémités."""
+    for _ in range(passes):
+        out = [pts[0]]
+        for a, b in zip(pts, pts[1:]):
+            out += [(0.75 * a[0] + 0.25 * b[0], 0.75 * a[1] + 0.25 * b[1]),
+                    (0.25 * a[0] + 0.75 * b[0], 0.25 * a[1] + 0.75 * b[1])]
+        pts = out + [pts[-1]]
+    return pts
+
+
+def build_ring_path(origin, dest, lane_off=LANE):
+    """Trajectoire de rond-point : entrée, arc de cercle dans le sens anti-horaire (vu de dessus), sortie."""
+    di, do = IN_DIR[origin], OUT_DIR[dest]
+    ri, ro = _right(di), _right(do)
+    p0 = (CX - di[0] * EDGE + ri[0] * lane_off, CY - di[1] * EDGE + ri[1] * lane_off)
+    e = (CX - di[0] * RING_HALF + ri[0] * lane_off, CY - di[1] * RING_HALF + ri[1] * lane_off)
+    x = (CX + do[0] * RING_HALF + ro[0] * LANE, CY + do[1] * RING_HALF + ro[1] * LANE)
+    q = (CX + do[0] * EDGE + ro[0] * LANE, CY + do[1] * EDGE + ro[1] * LANE)
+    join = math.radians(RING_JOIN)
+    a_in = math.atan2(-di[1], -di[0]) - join * lane_off / LANE
+    a_out = math.atan2(do[1], do[0]) + join
+    arc = (a_in - a_out) % (2 * math.pi)          # les angles décroissent : sens de circulation (écran, y vers le bas)
+    n = max(2, round(arc / math.radians(10)))
+    ring = [(CX + RING_R * math.cos(a_in - arc * k / n), CY + RING_R * math.sin(a_in - arc * k / n)) for k in range(n + 1)]
+    return Path([p0] + _lisser([e] + ring + [x]) + [q])
+
+
 class LightController:
     """Cycle de feux (vert 8 s, orange 2 s, tout-rouge 1 s) avec préemption pour véhicule d'urgence."""
 
     def __init__(self, phases):
+        """Initialise le cycle sur la première phase (liste d'ensembles de branches vertes simultanément)."""
         self.phases, self.idx, self.t, self.stage = [set(ph) for ph in phases], 0, 0.0, "green"
         self.hold, self.target, self.base = False, 0, len(self.phases)
 
@@ -145,23 +176,66 @@ def paths_conflict(a, b):
     return _CONFLICTS[k]
 
 
+_POINTS_COMMUNS = {}
+MARGE = 0.7   # rond-point : marge de sécurité (s) avant et après le passage d'un autre véhicule
+V_PRUDENCE = 55   # vitesse (px/s) d'un véhicule d'urgence qui s'engage sur un signal fermé, sans priorité V2I
+
+
+def _points_communs(a, b):
+    """Couples (s_a, s_b) : abscisses sur chaque trajectoire des endroits où elles se croisent ou se confondent."""
+    k = (a.key, b.key)
+    if k not in _POINTS_COMMUNS:
+        seuil, pts_b, debut = 19 if a.origin == b.origin else 26, b.path.box_points(), int(a.path.cum[1])
+        couples = []
+        for i, p in enumerate(a.path.box_points()):
+            d, j = min((math.dist(p, q), j) for j, q in enumerate(pts_b))
+            if d < seuil:
+                couples.append((debut + 10 * i, int(b.path.cum[1]) + 10 * j))
+        _POINTS_COMMUNS[k] = couples
+    return _POINTS_COMMUNS[k]
+
+
+def menace(o, v, marge=MARGE):
+    """Rond-point : `o` empêche-t-il `v` de s'insérer ? (acceptation d'intervalle)
+
+    Pour chaque endroit commun aux deux trajectoires que `o` n'a pas encore dépassé, on estime l'intervalle de temps
+    pendant lequel `o` puis `v` l'occupent (`v` en accélérant depuis sa vitesse actuelle). `v` cède seulement si ces
+    intervalles, élargis de MARGE, se chevauchent. Un véhicule déjà passé devant n'est jamais attendu : `v` le suit
+    à distance de sécurité, sans attendre la fin de son trajet.
+    """
+    if not paths_conflict(o, v):
+        return False
+    vo = max(o.v, 50.0)
+    for s_o, s_v in _points_communs(o, v):
+        arriere_o = o.s - o.length / 2
+        if arriere_o >= s_o:
+            continue                                                    # `o` est déjà passé à cet endroit
+        o_debut, o_fin = max(0.0, s_o - (o.s + o.length / 2)) / vo, (s_o - arriere_o) / vo
+        d = max(0.0, s_v - (v.s + v.length / 2))
+        v_debut = (-v.v + math.sqrt(v.v ** 2 + 2 * ACC * d)) / ACC
+        v_fin = v_debut + v.length / max(v.v + ACC * v_debut, 40.0)
+        if o_debut - marge < v_fin and v_debut - marge < o_fin:
+            return True
+    return False
+
+
 class Vehicle:
     """Véhicule suivant une trajectoire, avec modèle de suivi simple."""
     _next_id = 0
     SPECS = {"car": (30, 16, 85), "truck": (46, 18, 70), "bus": (52, 18, 70), "emergency": (34, 16, 140)}
 
-    def __init__(self, kind, origin, dest, color, lane_off=LANE):
+    def __init__(self, kind, origin, dest, color, lane_off=LANE, ring=False):
+        """Crée un véhicule (type, branche d'origine, destination, couleur) et calcule sa trajectoire."""
         Vehicle._next_id += 1
         self.id, self.kind, self.origin, self.dest, self.color = Vehicle._next_id, kind, origin, dest, color
         self.length, self.width, self.vmax = self.SPECS[kind][0], self.SPECS[kind][1], self.SPECS[kind][2]
         self.emergency = kind == "emergency"
-        self.path = build_path(origin, dest, lane_off)
+        self.path = (build_ring_path if ring else build_path)(origin, dest, lane_off)
         self.s, self.v = 0.0, 40.0
-        self.wait = self.stop_timer = self.blocked = 0.0
-        self.arrival = None
+        self.wait = self.blocked = 0.0
         self.entered = self.done = self.crossed = self.claimed = False
         self.etat = "en circulation"  # état tel que stocké en base
-        self.key = (origin, dest, lane_off)
+        self.key = (origin, dest, lane_off, ring)
         self.x = self.y = self.angle = self.hx = self.hy = 0.0
         self.refresh_pose()
 
@@ -175,6 +249,7 @@ class Simulation:
     """Simulation complète : trafic, régulation, urgence."""
 
     def __init__(self):
+        """Initialise la simulation (callbacks vides, densité, vitesse) sur le premier type de carrefour."""
         self.on_event = lambda kind, text: None
         self.on_request = lambda payload: None
         self.on_crossed = lambda payload: None
@@ -191,8 +266,7 @@ class Simulation:
         self.ctrl = LightController(self.cfg["phases"]) if self.cfg["mode"] == "lights" else None
         self.vehicles, self.em, self.t = [], None, 0.0
         self.em_requested = self.granted = False
-        self.interventions, self.waits = 0, deque(maxlen=50)
-        self.flow_entered = dict.fromkeys(SIDES, 0)
+        self.interventions = 0
         self.last_light, self.jam, self.last_stop, self.last_jam, self.return_until = {}, {}, {}, 0.0, 0.0
 
     def start(self):
@@ -215,23 +289,28 @@ class Simulation:
     # ---------------------------------------------------------------- urgence
     @property
     def emergency_active(self):
-        """Vrai tant qu'un véhicule d'urgence bénéficie de la priorité."""
+        """Vrai tant qu'un véhicule d'urgence bénéficie de la priorité V2I (accordée par le serveur)."""
         return self.em is not None and self.granted and not self.em.crossed
+
+    @property
+    def em_present(self):
+        """Vrai tant qu'un véhicule d'urgence est en approche ou dans le carrefour, bouton pressé ou non."""
+        return self.em is not None and not self.em.crossed
 
     def spawn_emergency(self, label, dest):
         """Fait apparaître un véhicule d'urgence vers `dest`, depuis une branche au hasard."""
         if self.em is not None and not self.em.crossed:
             return False
-        origins = [s for s in self.cfg["branches"] if s != dest]
-        if dest not in self.cfg["branches"] or not origins:
+        if dest not in SIDES:
             return False
-        origin = random.choice(origins)
-        self.em = Vehicle("emergency", origin, dest, EMERGENCY_TYPES.get(label, "#fff"), lane_off=0)
+        origin = random.choice([s for s in SIDES if s != dest])
+        self.em = Vehicle("emergency", origin, dest, EMERGENCY_TYPES.get(label, "#fff"), lane_off=0, ring=self._ring)
         self.em.label = label
         self.em_requested = self.granted = False
         self.vehicles.append(self.em)
         self._tele_vehicle(self.em)
         self.on_event("approach", f"Véhicule d'urgence en approche ({origin})")
+        self.on_event("v2v", "V2V : les véhicules détectent l'urgence et lui cèdent le passage")
         return True
 
     def request_priority(self):
@@ -263,19 +342,19 @@ class Simulation:
         """État du feu d'une branche (None hors régulation par feux)."""
         return self.ctrl.state(side) if self.ctrl else None
 
-    def counts_by_origin(self):
-        """Nombre de véhicules présents par branche d'entrée."""
-        counts = dict.fromkeys(SIDES, 0)
-        for v in self.vehicles:
-            counts[v.origin] += 1
-        return counts
+    @property
+    def _ring(self):
+        """Vrai si le carrefour courant est un rond-point."""
+        return self.cfg["mode"] == "round"
 
-    def avg_wait(self):
-        """Temps d'attente moyen (s) des derniers véhicules sortis."""
-        return sum(self.waits) / len(self.waits) if self.waits else 0.0
+    @property
+    def s_stop(self):
+        """Abscisse curviligne de la ligne d'arrêt (feux) ou de cédez-le-passage (rond-point)."""
+        return EDGE - RING_STOP if self._ring else S_STOP
 
     # ---------------------------------------------------------------- télémétrie vers le serveur
     def _tele_vehicle(self, v):
+        """Signale au serveur l'apparition d'un véhicule (si la télémétrie est active)."""
         if self.telemetry:
             kind = v.label.lower() if v.emergency else KIND_FR[v.kind]
             self.on_telemetry({"type": "vehicle", "vid": v.id, "kind": kind, "direction": v.origin, "destination": v.dest})
@@ -302,7 +381,9 @@ class Simulation:
 
     def _tele_lights(self):
         """Journal des feux : un message à chaque changement d'état, avec sa cause."""
-        for side in self.cfg["branches"]:
+        if self.ctrl is None:      # carrefours STOP / priorité à droite : pas de feux à journaliser
+            return
+        for side in SIDES:
             state = self.ctrl.state(side)
             if self.last_light.get(side) != state:
                 self.last_light[side] = state
@@ -316,7 +397,7 @@ class Simulation:
         if self.t - self.last_jam < 2.0:
             return
         self.last_jam = self.t
-        for side in self.cfg["branches"]:
+        for side in SIDES:
             n = sum(1 for v in self.vehicles if v.origin == side and not v.entered and v.v < 3)
             if n >= 6 and not self.jam.get(side):
                 self.jam[side] = True
@@ -336,7 +417,7 @@ class Simulation:
             self._tele_jam()
         self._spawn(dt)
         if (self.auto_request and self.em and not self.em_requested and not warmup
-                and S_STOP - (self.em.s + self.em.length / 2) < 220):
+                and self.s_stop - (self.em.s + self.em.length / 2) < 220):
             self.request_priority()
         for v in self.vehicles:
             self._step(v, dt)
@@ -347,6 +428,7 @@ class Simulation:
             self.em = None
 
     def _emergency_crossed(self):
+        """Traite le franchissement par le véhicule d'urgence : fin de priorité, retour au cycle normal, compte rendu au serveur."""
         em = self.em
         em.crossed = True
         was_granted, self.granted = self.granted, False
@@ -361,27 +443,27 @@ class Simulation:
                              "destination": em.dest, "junction": self.junction,
                              "duration": round(self.t - self.t_request, 1), "vid": em.id, "rid": getattr(em, "rid", None)})
         else:
-            self.on_event("crossed", f"{em.label} a franchi le carrefour sans priorité")
+            self.on_event("crossed", f"{em.label} a franchi le carrefour (passage cédé par les véhicules, sans demande V2I)")
 
     def _spawn(self, dt):
+        """Fait apparaître de nouveaux véhicules sur chaque branche selon la densité de trafic."""
         rate = 0.12 + 0.09 * self.density  # véhicules / s / branche
-        for side in self.cfg["branches"]:
+        for side in SIDES:
             if random.random() > rate * dt:
                 continue
             if any(o.origin == side and not o.emergency and o.s < 85 for o in self.vehicles):
                 continue
             r = random.random()
             dest = OPP[side] if r < 0.7 else (RIGHT_OF[side] if r < 0.92 else OPP[RIGHT_OF[side]])
-            if dest not in self.cfg["branches"]:
-                dest = OPP[side] if OPP[side] in self.cfg["branches"] else RIGHT_OF[side]
             k = random.random()
             kind, color = (("bus", "#f0b429") if k < 0.06 else ("truck", random.choice(["#e8e8e8", "#8a949e"]))
                            if k < 0.14 else ("car", random.choice(CAR_COLORS)))
-            veh = Vehicle(kind, side, dest, color)
+            veh = Vehicle(kind, side, dest, color, ring=self._ring)
             self.vehicles.append(veh)
             self._tele_vehicle(veh)
 
     def _leader_gap(self, v):
+        """Distance libre jusqu'au véhicule qui précède `v` sur sa trajectoire (None si aucun)."""
         if v.blocked > 3:  # anti-interblocage
             return None
         best = None
@@ -396,9 +478,10 @@ class Simulation:
             best = gap if best is None else min(best, gap)
         return best
 
-    @staticmethod
-    def _in_box(o, margin=0):
-        return abs(o.x - CX) < HALF + margin and abs(o.y - CY) < HALF + margin
+    def _in_box(self, o):
+        """Vrai si le véhicule `o` se trouve dans la zone de croisement du carrefour."""
+        demi = RING_HALF if self._ring else HALF
+        return abs(o.x - CX) < demi and abs(o.y - CY) < demi
 
     def _free_to_claim(self, v):
         """Réservation du carrefour : aucun véhicule engagé ne doit croiser mon trajet et la sortie doit être libre."""
@@ -406,55 +489,42 @@ class Simulation:
         for o in self.vehicles:
             if o is v or o.done:
                 continue
-            if (self.emergency_active and not v.emergency and o is self.em
-                    and self.em.s + self.em.length / 2 > S_STOP - 260 and paths_conflict(v, self.em)):
-                return False  # le carrefour est gardé libre pour le véhicule d'urgence
-            if o.claimed and paths_conflict(v, o):
+            if (self.em_present and not v.emergency and o is self.em
+                    and self.em.s + self.em.length / 2 > self.s_stop - 300 and paths_conflict(v, self.em)):
+                return False  # les véhicules ont repéré l'urgence : le carrefour lui est laissé libre
+            if self._ring:
+                if (o.claimed or o.entered) and menace(o, v, 0.2 if v.emergency else MARGE):
+                    return False
+            elif o.claimed and paths_conflict(v, o):
                 return False
             if math.hypot(o.x - ex, o.y - ey) < 28 and o.v < 8:
                 return False
         return True
 
-    def _box_clear(self, v):
-        return not any(o is not v and not o.done and o.origin != v.origin and self._in_box(o, 6)
-                       for o in self.vehicles)
-
     def _may_enter(self, v, d):
         """Décide si `v` peut franchir la ligne d'arrêt (d = distance restante)."""
-        mode = self.cfg["mode"]
-        if mode == "lights":
+        if v.emergency:   # l'urgence s'engage dès que la voie est libre (`_free_to_claim`), même au feu rouge
+            return True
+        if self.cfg["mode"] == "lights":
             st = self.ctrl.state(v.origin)
             return st == "green" or (st == "orange" and v.v ** 2 / (2 * DECEL) > d)
-        if v.emergency and self.granted:
-            return True
-        if self.emergency_active and v.origin != self.em.origin:
-            return False
-        if mode == "stop":
-            return (v.stop_timer >= 1.0 and self._box_clear(v) and
-                    not any(o is not v and o.arrival is not None and not o.entered and o.arrival < v.arrival
-                            for o in self.vehicles))
-        right = RIGHT_OF[v.origin]  # priorité à droite
-        right_busy = any(o.origin == right and not o.entered and o.s + o.length / 2 > S_STOP - 120
-                         for o in self.vehicles)
-        return self._box_clear(v) and (not right_busy or v.stop_timer > 3.0)
+        # rond-point : on cède le passage (la réservation `_free_to_claim` s'en charge) ; avec la priorité V2I, les autres branches marquent l'arrêt
+        return not (self.emergency_active and v.origin != self.em.origin)
 
     def _step(self, v, dt):
+        """Avance le véhicule `v` de `dt` secondes : suivi du véhicule de tête, arrêt au feu ou au cédez-le-passage, franchissement."""
         limit = v.vmax * self.speed
         gap = self._leader_gap(v)
         if gap is not None:
             limit = min(limit, math.sqrt(2 * DECEL * max(gap - 10, 0)))
         front = v.s + v.length / 2
         if not v.entered:
-            if front > S_STOP:
-                v.entered = True
-                self.flow_entered[v.origin] += 1
+            if front > self.s_stop:
+                v.entered = v.claimed = True    # engagé (même sans réservation préalable) : les autres le voient
             else:
-                d = S_STOP - front
-                zone = 10 if self.cfg["mode"] == "stop" else 120
-                if self.cfg["mode"] != "lights" and d < zone and v.v < 3:
-                    v.stop_timer += dt
-                    if v.arrival is None:
-                        v.arrival = self.t
+                d = self.s_stop - front
+                if v.emergency and not self.granted and self.ctrl and self.ctrl.state(v.origin) != "green" and d < 140:
+                    limit = min(limit, V_PRUDENCE)   # signal fermé et pas de priorité V2I : l'urgence s'engage prudemment
                 if not (v.claimed or (self._may_enter(v, d) and self._free_to_claim(v))):
                     limit = min(limit, math.sqrt(2 * DECEL * max(d - 2, 0)))
                 elif d < 30 + v.v ** 2 / (2 * DECEL):
@@ -470,7 +540,5 @@ class Simulation:
             v.claimed = False  # carrefour libéré
         if v.s >= v.path.length - 1:
             v.done = True
-            if not v.emergency:
-                self.waits.append(v.wait)
         else:
             v.refresh_pose()

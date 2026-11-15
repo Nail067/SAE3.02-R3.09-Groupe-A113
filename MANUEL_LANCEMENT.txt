@@ -1,0 +1,142 @@
+===============================================================
+ MANUEL RAPIDE - Lancer le projet "carrefour connecté" sur une VM
+ SAÉ 3.02 - Groupe A113
+===============================================================
+
+Il faut :
+  - une VM Debian 12/13 ou Ubuntu 24.04 avec Internet
+  - un PC Windows avec Python
+  - le fichier carrefour-connecte-v20.zip sur le PC (dans Téléchargements)
+
+
+---------------------------------------------------------------
+ 0. PRÉPARER VIRTUALBOX (une seule fois)
+---------------------------------------------------------------
+Pour que le PC joigne le serveur, il faut une redirection de port.
+Dans PowerShell sur le PC, VM allumée :
+
+  $vbox = "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
+  & $vbox controlvm "Debian 12" natpf1 "carrefour,tcp,,5050,,5050"
+  & $vbox controlvm "Debian 12" natpf1 "ssh,tcp,,2222,,22"
+
+(La 2e règle sert seulement si vous passez par SSH.)
+Si le message "already exists" s'affiche, la règle est déjà en place :
+ce n'est pas une erreur.
+
+
+---------------------------------------------------------------
+ 1. METTRE LE PROJET SUR LA VM
+---------------------------------------------------------------
+>> Sans SSH (en tapant dans la fenêtre de la VM)
+
+  Sur le PC, dans PowerShell :
+    cd $HOME\Downloads
+    py -m http.server 8000
+
+  Dans le terminal de la VM :
+    wget http://10.0.2.2:8000/carrefour-connecte-v20.zip
+
+  Revenir dans PowerShell et faire Ctrl+C pour arrêter le partage.
+
+>> Avec SSH (copier-coller possible)
+
+  Dans la VM :
+    sudo apt install -y openssh-server
+
+  Sur le PC, dans PowerShell :
+    scp -P 2222 "$HOME\Downloads\carrefour-connecte-v20.zip" <utilisateur>@127.0.0.1:~
+    ssh -p 2222 <utilisateur>@127.0.0.1
+
+
+---------------------------------------------------------------
+ 2. INSTALLER (dans la VM ou en SSH, c'est pareil)
+---------------------------------------------------------------
+  sudo apt install -y unzip
+  unzip carrefour-connecte-v20.zip && cd carrefour-connecte
+  sudo ./install.sh tout --jeton test1234
+
+L'installation doit se terminer par "tout est conforme".
+
+Avec 2 VM (base et serveur séparés) :
+  Remplacer tout <...>, chevrons compris. Noter l'adresse de chaque VM avec : ip -br a
+  Vérifier que les VM se voient : ping <IP_VM_BASE> depuis la VM serveur.
+  - Sur la VM base, EN PREMIER :
+      sudo ./install.sh database --serveur <IP_VM_SERVEUR>
+  - Sur la VM serveur : copier-coller la ligne affichée à la fin, par exemple
+      sudo ./install.sh serveur --db <IP_VM_BASE> --mdp <MOT_DE_PASSE> --jeton test1234
+    Elle doit finir par "tout est conforme" et "(moteur : mariadb)".
+  - Sur le PC : .\demarrer.bat vm <IP_VM_SERVEUR> test1234
+  Ensuite, les VM peuvent démarrer dans n'importe quel ordre : le serveur
+  attend la base et l'interface garde les événements en attente.
+
+
+---------------------------------------------------------------
+ 3. LANCER L'INTERFACE (sur le PC, jamais dans la VM)
+---------------------------------------------------------------
+  cd $HOME\Downloads
+  Expand-Archive .\carrefour-connecte-v20.zip -DestinationPath . -Force
+  cd .\carrefour-connecte
+  .\demarrer.bat vm 127.0.0.1 test1234
+
+  - Mettez 127.0.0.1 si la VM est en NAT avec la redirection 5050.
+  - Mettez l'adresse 192.168.56.x de la VM si elle a une carte
+    "réseau privé hôte".
+  - Ensuite, .\demarrer.bat vm suffit : l'adresse et le jeton sont mémorisés.
+
+
+---------------------------------------------------------------
+ EN CAS DE PROBLÈME
+---------------------------------------------------------------
+* "Permission denied" sur ./install.sh
+    -> sudo bash install.sh tout --jeton test1234
+
+* "toto n'est pas dans le fichier sudoers"
+    -> su -   puis   usermod -aG sudo toto   puis se reconnecter
+
+* "demarrer.bat: command not found"
+    -> Vous êtes dans la VM : lancez-le sur le PC.
+
+* L'interface affiche "Serveur déconnecté"
+    -> Vérifiez la redirection 5050 (étape 0) et le serveur dans la VM :
+       sudo systemctl status carrefour-serveur
+
+* Vous avez oublié le jeton
+    -> Dans la VM : sudo ./scripts/infos.sh
+
+* Vous voulez réinstaller après une modification
+    -> Mettez le nouveau zip, faites unzip -o ..., puis relancez la même
+       commande install.sh.
+
+* Windows Defender signale "Wacatac.B!ml" sur le zip
+    -> Faux positif connu (le suffixe !ml = détection automatique) déclenché par
+       demarrer.bat. Récupérer plutôt le projet avec :
+       git clone https://github.com/Nail067/SAE3.02-R3.09-Groupe-A113.git
+
+
+---------------------------------------------------------------
+ ANNEXE - PRÉPARER DEUX VM VIRTUALBOX (tests à la maison uniquement)
+---------------------------------------------------------------
+Inutile sur des VM fournies déjà en réseau.
+
+1. Cloner la VM éteinte : clic droit > Cloner > Clone intégral,
+   avec "Générer de nouvelles adresses MAC".
+
+2. Deux cartes réseau par VM (VM éteintes), dans PowerShell :
+     $vbox = "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
+     $ho = "VirtualBox Host-Only Ethernet Adapter"
+     & $vbox modifyvm "<VM>" --nic1 nat --nic2 hostonly --hostonlyadapter2 $ho --macaddress1 auto --macaddress2 auto
+
+3. Un profil réseau par carte, dans chaque VM (en root, après su -) :
+     nmcli connection add type ethernet ifname enp0s3 con-name nat connection.autoconnect-priority 10
+     nmcli connection add type ethernet ifname enp0s8 con-name hostonly connection.autoconnect-priority 10
+     nmcli connection up nat
+     nmcli connection up hostonly
+     ip -br a        (enp0s3 = 10.0.2.15, enp0s8 = 192.168.56.x)
+
+4. SSH depuis le PC : apt install -y openssh-server dans la VM, puis
+     ssh <utilisateur>@192.168.56.x
+     scp <fichier> <utilisateur>@192.168.56.x:~
+
+5. VM qui avait déjà "install.sh tout" et devient VM serveur :
+     sudo systemctl disable --now mariadb
+

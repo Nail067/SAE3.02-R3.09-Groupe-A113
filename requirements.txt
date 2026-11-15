@@ -1,4 +1,5 @@
 PyQt6==6.6.1
 PyQt6-Qt6==6.6.1
-PyQt6-sip==13.6.0
-mariadb==1.1.10
+PyQt6-sip==13.13.1
+# Connecteur MariaDB : utilisé par le SERVEUR (VM Linux). Ignoré sous Windows/macOS (le client IHM n'en a pas besoin).
+mariadb==1.1.10; sys_platform == "linux"

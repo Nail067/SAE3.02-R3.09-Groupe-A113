@@ -1,0 +1,23 @@
+[Unit]
+Description=Serveur carrefour connecté (SAÉ 3.02 - groupe A113)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=carrefour
+Group=carrefour
+WorkingDirectory=/opt/carrefour-connecte
+EnvironmentFile=/etc/carrefour/serveur.env
+ExecStart=/opt/carrefour-connecte/venv/bin/python -m server.server
+Restart=on-failure
+RestartSec=3
+# Durcissement
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/carrefour
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+# /etc/network/interfaces – VM SERVEUR (Debian 12)
+# Vérifier les noms des interfaces avec :  ip -br link   (en général enp0s3, enp0s8, enp0s9)
+auto lo
+iface lo inet loopback
+
+# Adaptateur 1 : NAT VirtualBox (accès Internet pour apt/pip uniquement)
+allow-hotplug enp0s3
+iface enp0s3 inet dhcp
+
+# Adaptateur 2 : réseau « clients » (host-only) -> le PC se connecte ici, port 5050
+auto enp0s8
+iface enp0s8 inet static
+    address 192.168.56.101/24
+
+# Adaptateur 3 : réseau « données » (réseau interne VirtualBox) -> liaison vers la VM Database, port 3306
+auto enp0s9
+iface enp0s9 inet static
+    address 10.10.10.1/24
